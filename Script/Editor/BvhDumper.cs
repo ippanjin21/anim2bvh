@@ -1,6 +1,7 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using UnityEngine;
 using UnityEditor;
 
@@ -14,9 +15,9 @@ namespace ippanjin21
         private int _selectIndex = 0;
         private bool _dumpRootMotion = false;
         private Transform _selectRootTransform = null;
+        private bool _ToRightHandedCoordinate = true;
 
         private Dictionary<string, string> _motionStateDictionary = new Dictionary<string, string>();
-        private List<Transform> transforms_ = new List<Transform>();
         private LinkedList<Vector3> _positionsBackup = new LinkedList<Vector3>();
         private LinkedList<Quaternion> _rotationsBackup = new LinkedList<Quaternion>();
 
@@ -47,6 +48,7 @@ namespace ippanjin21
             _selectIndex = EditorGUILayout.Popup("AnimationClip", _selectIndex, _motionNames);
             _dumpRootMotion = EditorGUILayout.Toggle("Dump RootMotion/Rotation", _dumpRootMotion);
             _selectRootTransform = (Transform)EditorGUILayout.ObjectField("Root Transform", _selectRootTransform, typeof(Transform), true);
+            _ToRightHandedCoordinate = EditorGUILayout.Toggle("To Right-handed coordinate", _ToRightHandedCoordinate);
 
             // Bone の構造を Dump するだけに留めるのが良いようだ。
             if (GUILayout.Button("Dump"))
@@ -163,30 +165,31 @@ namespace ippanjin21
                 }
             }
 
-            errorDetected_ = false;
+            _baseRootPosition = root.transform.position;
+            _baseRootRotation = root.transform.rotation;
+
+            Bone rootBone = null;
             if (animator.isHuman)
             {
-                DumpHumanJoint(root, animator, fs);
-            } else
-            {
-                DumpGenericJoin(root, fs);
+                //DumpHumanJoint(root, animator, fs);
+                rootBone = GenerateHumanJoint(root, animator);
+                if (rootBone == null)
+                {
+                    return;
+                }
             }
-            if (errorDetected_)
+            else
             {
-                Debug.LogError("Error detected while dumping transforms.");
                 return;
             }
+
+            DumpHumanJoint(rootBone, fs);
+
 
             fs.WriteLine("MOTION");
             int frameCount = Mathf.RoundToInt(clipLength * frameRate);
             fs.WriteLine("Frames: " + frameCount);
             fs.WriteLine("Frame Time: " + (1.0f / frameRate).ToString("F8"));
-
-            if (_dumpRootMotion)
-            {
-                _baseRootPosition = root.transform.position;
-                _baseRootRotation = root.transform.rotation;
-            }
 
             // 現在の Transform を記憶する。
             BackupTransforms(_positionsBackup, _rotationsBackup, _target.transform);
@@ -196,22 +199,22 @@ namespace ippanjin21
             bool applyRootMotion = animator.applyRootMotion;
             AnimatorCullingMode cullingMode = animator.cullingMode;
 
-            animator.updateMode = AnimatorUpdateMode.Normal;
+            animator.updateMode = AnimatorUpdateMode.UnscaledTime;
             animator.applyRootMotion = true;
             animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
 
-            // Animation をステップ再生させながら、Motion の情報を抜き出す。
+            animator.speed = 1f;
             for (int i = 0; i < frameCount; i++)
             {
                 float frameSec = i / frameRate;
                 animator.PlayInFixedTime(stateName, 0, frameSec);
-                animator.speed = 1f;
-                animator.Update(1.0f / frameRate);
-                DumpTranforms(transforms_, fs);
+                animator.Update(0.0000001f);
+                //Debug.Log("NormalizedTime = " + animator.GetCurrentAnimatorStateInfo(0).normalizedTime.ToString("F8"));
+                DumpHumanTransform(rootBone, fs);
             }
 
             // 元の Transform に戻す。
-            RecoverTransforms(_positionsBackup, _rotationsBackup, _target.transform);
+            RestoreTransforms(_positionsBackup, _rotationsBackup, _target.transform);
             // Animator の状態を戻す。
             animator.speed = speed;
             animator.updateMode = updateMode;
@@ -222,103 +225,305 @@ namespace ippanjin21
             _rotationsBackup.Clear();
         }
 
-        private bool errorDetected_ = false;
-
-        private void DumpHumanJoint(in Transform root, in Animator animator, in StreamWriter fs)
+        class Bone
         {
-            transforms_.Clear();
-            TraverseHumanJoint(root, animator, 0, transforms_, fs);
-        }
-
-        private bool TraverseHumanJoint(in Transform current, in Animator animator, int level, in List<Transform> transforms, in StreamWriter fs)
-        {
-            string leadingSpace = GetIndexSpace(level);
-
-            if (IsHumanBodyBone(current, animator))
+            private enum Termination
             {
-                if (transforms.Count <= 0)
+                NotTerminated,
+                Terminated,
+                Root,
+            };
+
+            private Transform transform_ = null;
+            private Vector3 basePosition_ = Vector3.zero;
+            private Quaternion baseRotation_ = Quaternion.identity;
+            private Termination terminated_ = Termination.NotTerminated;
+            private Bone parent_ = null;
+            private LinkedList<Bone> children_ = null;
+
+
+            public static Bone Create(in Transform transform)
+            {
+                return new Bone(transform);
+            }
+
+            public static Bone CreateTerminated(in Transform transform)
+            {
+                return new Bone(transform, Termination.Terminated);
+            }
+
+            public bool MarkRoot()
+            {
+                if (IsTerminated)
+                    return false;
+                terminated_ = Termination.Root;
+                return true;
+            }
+
+            public Transform Transform { get { return transform_; } }
+
+            public bool IsRoot { get { return parent_ == null || terminated_ == Termination.Root; } }
+
+            public bool IsTerminated { get { return terminated_ == Termination.Terminated; } }
+
+            public Bone Parent { get { return parent_; } }
+
+            public Vector3 BasePosition { get { return basePosition_; } }
+            public Quaternion BaseRotation { get { return baseRotation_; } }
+
+            public bool AddChild(in Bone child)
+            {
+                if (IsTerminated || children_ == null)
+                    return false;
+                if (child.IsTerminated && children_.Count > 0)
+                    return false;
+                if (child.terminated_ == Termination.Root)
+                    return false;
+                children_.AddLast(child);
+                child.parent_ = this;
+                return true;
+            }
+
+            public bool RemoveChild(in Bone child)
+            {
+                if (children_ == null)
+                    return false;
+                if (!children_.Remove(child))
+                    return false;
+                child.parent_ = null;
+                return true;
+            }
+
+            public int ChildCount { get { return children_ == null ? 0 : children_.Count; } }
+
+            public LinkedList<Bone> Children { get { return children_; } }
+
+
+            public Quaternion LocalRotation
+            {
+                get
                 {
-                    fs.WriteLine(leadingSpace + "HIERARCHY");
-                    fs.WriteLine(leadingSpace + "ROOT " + current.name);
-                    fs.WriteLine(leadingSpace + "{");
-                    fs.WriteLine(leadingSpace + "    OFFSET 0.00000000 0.00000000 0.00000000");
-                    // Unity の EulerAngle は Z-X-Y
-                    fs.WriteLine(leadingSpace + "    CHANNELS 6 Xposition Yposition Zposition Yrotation Xrotation Zrotation");
+                    if (parent_ == null)
+                    {
+                        return Quaternion.Inverse(baseRotation_) * Transform.rotation;
+                    }
+
+                    //if (parent_.Transform == Transform.parent)
+                   // {
+                    //    return Transform.localRotation * Quaternion.Inverse(baseRotation_);
+                   // }
+                    //else
+                    {
+                        return Quaternion.Inverse(baseRotation_) * Quaternion.Inverse(parent_.Transform.rotation) * Transform.rotation;
+                    }
+                }
+            }
+
+            public void UpdateBasePositionRotation()
+            {
+                if (parent_ == null)
+                {
+                    baseRotation_ = Transform.rotation;
+                    basePosition_ = Transform.position;
+                    return;
+                }
+                //if (parent_.Transform == Transform.parent)
+                //{
+                //    baseRotation_ = Transform.localRotation;
+                //    basePosition_ = Transform.localPosition;
+                //}
+                //else
+                {
+                    // Quaternion の演算順序は正しいのか？ Quaternion の積は交換法則が成立しないので、
+                    // 順序が重要。
+
+                    baseRotation_ = Quaternion.Inverse(parent_.Transform.rotation) * Transform.rotation;
+                    basePosition_ = Quaternion.Inverse(baseRotation_) * (Transform.position - parent_.Transform.position);
+
+                    Debug.AssertFormat(Quaternion.Angle(baseRotation_, Transform.localRotation) < 1.0f,
+                        baseRotation_.ToString("F8") + " != "  + Transform.localRotation.ToString("F8")
+                        );
+                }
+            }
+
+
+            private Bone(in Transform transform)
+            {
+                transform_ = transform;
+                terminated_ = Termination.NotTerminated;
+                children_ = new LinkedList<Bone>();
+            }
+
+            private Bone(in Transform transform, in Termination terminated)
+            {
+                transform_ = transform;
+                terminated_ = terminated;
+                if (terminated_ != Termination.Terminated)
+                {
+                    children_ = new LinkedList<Bone>();
                 }
                 else
                 {
-                    fs.WriteLine(leadingSpace + "JOINT " + current.name);
-                    fs.WriteLine(leadingSpace + "{");
-                    fs.WriteLine(leadingSpace + "    OFFSET " + current.localPosition.x.ToString("F8") + " " + current.localPosition.y.ToString("F8") + " " + current.localPosition.z.ToString("F8"));
-                    fs.WriteLine(leadingSpace + "    CHANNELS 3 Yrotation Xrotation Zrotation");
+                    children_ = null;
                 }
+            }
+        };
 
-                transforms.Add(current);
+        private Bone GenerateHumanJoint(in Transform root, in Animator animator)
+        {
+            Bone rootBone = null;
+            bool rootIsHumanBodyBone = false;
+            if (IsHumanBodyBone(root, animator))
+            {
+                rootBone = Bone.Create(root.parent);
+                rootIsHumanBodyBone = true;
+            }
+            else
+            {
+                rootBone = Bone.Create(root);
+            }
+            if (!TraverseHumanJoint(rootBone, root, animator))
+            {
+                return null;
+            }
 
-                Transform leaf = null;
+            if (rootBone.ChildCount != 1)
+            {
+                return null;
+            }
+
+            UpdateBasePositionRotation(rootBone);
+
+            // RootMotion を生成し、かつ Root が HumanBodyBone ではない(例. Armature)なら
+            // Root をそのまま使う。
+            if (_dumpRootMotion && !rootIsHumanBodyBone)
+            {
+                return rootBone;
+            }
+
+            // Root はその子供。(RootBone は Parent Transform が欲しいのでそのためだけに残す)
+            Bone bone = rootBone.Children.First.Value;
+            if (!bone.MarkRoot())
+            {
+                return null;
+            }
+            return bone;
+        }
+
+        private void UpdateBasePositionRotation(in Bone current)
+        {
+            current.UpdateBasePositionRotation();
+            if (current.ChildCount <= 0)
+                return;
+
+            foreach(var child in current.Children)
+            {
+                UpdateBasePositionRotation(child);
+            }
+        }
+
+        private bool TraverseHumanJoint(in Bone parentBone, in Transform current, in Animator animator)
+        {
+            if (IsHumanBodyBone(current, animator))
+            {
+                Bone bone = Bone.Create(current);
+
+                if (!parentBone.AddChild(bone))
+                    return false;
+
                 for (int i = 0; i < current.childCount; i++)
                 {
                     Transform child = current.GetChild(i);
-
                     if (!child.gameObject.activeSelf)
                         continue;
 
-                    if (child.name.ToLower() == current.name.ToLower() + "_end")
-                    {
-                        // Leaf Node
-                        leaf = child;
-                    }
+                    if (!TraverseHumanJoint(bone, child, animator))
+                        return false;
                 }
-
-                if (leaf == null)
-                {
-                    int count = 0;
-                    for (int i = 0; i < current.childCount; i++)
-                    {
-                        Transform child = current.GetChild(i);
-                        if (!child.gameObject.activeSelf)
-                            continue;
-
-                        if (!TraverseHumanJoint(child, animator, level + 1, transforms, fs))
-                        {
-                            if (!errorDetected_)
-                            {
-                                Debug.LogError("Missing " + current.name + "_end");
-                                errorDetected_ = true;
-                            }
-                            return false;
-                        }
-                        count++;
-                    }
-                    if (count <= 0)
-                    {
-                        return false; // Not terminated.
-                    }
-                } else
-                {
-                    Vector3 offset = leaf.localPosition;
-                    fs.WriteLine(leadingSpace + "    END SITE");
-                    fs.WriteLine(leadingSpace + "    {");
-                    fs.WriteLine(leadingSpace + "        OFFSET " + offset.x.ToString("F8") + " " + offset.y.ToString("F8") + " " + offset.z.ToString("F8"));
-                    fs.WriteLine(leadingSpace + "    }");
-
-                    // terminated
-                }
-                fs.WriteLine(leadingSpace + "}");
             } else
             {
+                // 終端ノード
+                if (parentBone.Transform != null && current.name.ToLower() == parentBone.Transform.name.ToLower() + "_end")
+                {
+                    return parentBone.AddChild(Bone.CreateTerminated(current));
+                }
+
                 for (int i = 0; i < current.childCount; i++)
                 {
                     Transform child = current.GetChild(i);
                     if (!child.gameObject.activeSelf)
                         continue;
 
-                    if (!TraverseHumanJoint(child, animator, level, transforms, fs))
+                    if (!TraverseHumanJoint(parentBone, child, animator))
                         return false;
                 }
             }
             return true;
         }
+
+        private void DumpHumanJoint(in Bone root, in StreamWriter fs)
+        {
+            DumpHumanJoint(root, 0, fs);
+        }
+
+        private bool DumpHumanJoint(in Bone current, int level, in StreamWriter fs)
+        {
+            string leadingSpace = GetIndexSpace(level);
+
+            if (current.IsRoot)
+            {
+                fs.WriteLine(leadingSpace + "HIERARCHY");
+                fs.WriteLine(leadingSpace + "ROOT " + current.Transform.name);
+                fs.WriteLine(leadingSpace + "{");
+
+                //fs.WriteLine(leadingSpace + "    OFFSET 0.0000000 0.0000000 0.0000000");
+                fs.WriteLine(leadingSpace + "    OFFSET " + PositionToString(current.Transform.position - (current.Parent != null ? current.Parent.Transform.position : current.BasePosition)));
+
+                // Unity の EulerAngle は Z-X-Y
+                fs.WriteLine(leadingSpace + "    CHANNELS 6 Xposition Yposition Zposition Yrotation Xrotation Zrotation");
+            }
+            else
+            {
+                Vector3 localPos = CovertPosition(current.Transform.position - current.Parent.Transform.position);
+                if (!current.IsTerminated)
+                {
+                    fs.WriteLine(leadingSpace + "JOINT " + current.Transform.name);
+                    fs.WriteLine(leadingSpace + "{");
+                    // Blender は JOINT から勝手に Reset Matrix を作り出して、渡した Rotation をずらしてしまう。従って、JOINT は常に余計な Reset Matrix が
+                    // 生じない 0 Length 0 に固定する。
+                    fs.WriteLine(leadingSpace + "    OFFSET 0.000000 " + localPos.magnitude.ToString("F8") + " 0.0000000");
+                    fs.WriteLine(leadingSpace + "    CHANNELS 3 Yrotation Xrotation Zrotation");
+                } else
+                {
+                    Vector3 endOffset = CovertPosition(current.Transform.position - current.Parent.Transform.position);
+                    fs.WriteLine(leadingSpace + "    END SITE");
+                    fs.WriteLine(leadingSpace + "    {");
+                    fs.WriteLine(leadingSpace + "        OFFSET 0.000000 " + endOffset.magnitude.ToString("F8") + " 0.0000000");
+                    fs.WriteLine(leadingSpace + "    }");
+                    return true;
+                }
+            }
+
+            if (!current.IsTerminated && current.ChildCount <= 0)
+            {
+                // Error
+                Debug.LogError("Bone: \"" + current.Transform.name + "\" is not terminated by \"" + current.Transform.name + "_end\".");
+                return false;
+            }
+
+            foreach(var child in current.Children)
+            {
+                if (!DumpHumanJoint(child, level + 1, fs))
+                {
+                    return false;
+                }
+            }
+
+            fs.WriteLine(leadingSpace + "}");
+            return true;
+        }
+
+
 
         private bool IsHumanBodyBone(in Transform current, in Animator animator)
         {
@@ -336,120 +541,58 @@ namespace ippanjin21
             return false;
         }
 
-        private void DumpGenericJoin(in Transform root, in StreamWriter fs)
+
+        private void DumpHumanTransform(in Bone root, in StreamWriter fs)
         {
-            transforms_.Clear();
-            TraverseGenericJoint(root, 0, transforms_, fs);
+            StringBuilder builder = new StringBuilder();
+            DumpHumanTransform(root, Quaternion.identity, builder);
+            fs.WriteLine(builder.ToString());
         }
 
-        private bool TraverseGenericJoint(in Transform current, int level, in List<Transform> transforms, in StreamWriter fs)
+        private void DumpHumanTransform(in Bone current, in Quaternion parentRotation, in StringBuilder builder)
         {
-            string leadingSpace = GetIndexSpace(level);
+            Quaternion currentRotation;
 
-            if (transforms.Count <= 0)
+            if (current.IsRoot)
             {
-                fs.WriteLine(leadingSpace + "HIERARCHY");
-                fs.WriteLine(leadingSpace + "ROOT " + current.name);
-                fs.WriteLine(leadingSpace + "{");
-                fs.WriteLine(leadingSpace + "    OFFSET 0.00000000 0.00000000 0.00000000");
-                // Unity の EulerAngle は Z-X-Y
-                fs.WriteLine(leadingSpace + "    CHANNELS 6 Xposition Yposition Zposition Yrotation Xrotation Zrotation");
-            }
-            else
-            {
-                fs.WriteLine(leadingSpace + "JOINT " + current.name);
-                fs.WriteLine(leadingSpace + "{");
-                fs.WriteLine(leadingSpace + "    OFFSET " + current.localPosition.x.ToString("F8") + " " + current.localPosition.y.ToString("F8") + " " + current.localPosition.z.ToString("F8"));
-                fs.WriteLine(leadingSpace + "    CHANNELS 3 Yrotation Xrotation Zrotation");
-            }
+                Vector3 currentPosition;
 
-            transforms.Add(current);
-
-            Transform leaf = null;
-            for (int i =0; i < current.childCount; i ++)
-            {
-                Transform child = current.GetChild(i);
-
-                if (!child.gameObject.activeSelf)
-                    continue;
-
-                if (child.name.ToLower() == current.name.ToLower() + "_end")
+                if (_dumpRootMotion)
                 {
-                    // Leaf Node
-                    leaf = child;
-                }
-            }
-            if (leaf == null)
-            {
-                int count = 0;
-                for (int i = 0; i < current.childCount; i++)
-                {
-                    Transform child = current.GetChild(i);
-                    if (!child.gameObject.activeSelf)
-                        continue;
-
-                    if (!TraverseGenericJoint(child, level + 1, transforms, fs))
-                    {
-                        return false;
-                    }
-                    count++;
-                }
-                if (count <= 0)
-                {
-                    Debug.LogError("Missing " + current.name + "_end transform.");
-                    errorDetected_ = true;
-                    return false;
-                }
-            } else
-            {
-                Vector3 offset = leaf.localPosition;
-                string endName = "SITE";
-                fs.WriteLine(leadingSpace + "    END " + endName);
-                fs.WriteLine(leadingSpace + "    {");
-                fs.WriteLine(leadingSpace + "        OFFSET " + offset.x.ToString("F8") + " " + offset.y.ToString("F8") + " " + offset.z.ToString("F8"));
-                fs.WriteLine(leadingSpace + "    }");
-            }
-            fs.WriteLine(leadingSpace + "}");
-            return true;
-        }
-
-        private void DumpTranforms(in List<Transform> transforms, in StreamWriter fs)
-        {
-            string buf = "";
-            foreach (var item in transforms)
-            {
-                if (buf.Length == 0)
-                {
-                    Vector3 rootMovement = Vector3.zero;
-                    Vector3 rootEulerRotation = Vector3.zero;
-
-                    if (_dumpRootMotion)
-                    {
-                        rootMovement = item.transform.position - _baseRootPosition;
-                        Quaternion rootRotation = item.transform.rotation * Quaternion.Inverse(_baseRootRotation);
-
-                        rootEulerRotation = NormalizeEulerAngle(rootRotation.eulerAngles);
-                    }
-                    else
-                    {
-                        rootMovement = item.localPosition;
-                        rootEulerRotation = NormalizeEulerAngle(item.localRotation.eulerAngles);
-                    }
-
-                    // Xposition Yposition Zposition Yrotation Xrotation Zrotation
-                    buf +=
-                        rootMovement.x.ToString("F8") + " " + rootMovement.y.ToString("F8") + " " + rootMovement.z.ToString("F8") + " " +
-                        rootEulerRotation.y.ToString("F8") + " " + rootEulerRotation.x.ToString("F8") + " " + rootEulerRotation.z.ToString("F8");
+                    currentPosition = current.Transform.position - _baseRootPosition;
+                    currentRotation = current.Transform.rotation * Quaternion.Inverse(_baseRootRotation);
                 }
                 else
                 {
-                    Vector3 angle = NormalizeEulerAngle(item.localRotation.eulerAngles);
-
-                    // Yrotation Xrotation Zrotation
-                    buf += " " + angle.y.ToString("F8") + " " + angle.x.ToString("F8") + " " + angle.z.ToString("F8");
+                    currentPosition = current.Transform.position - (current.Parent != null ? current.Parent.Transform.position : current.BasePosition);
+                    currentRotation = current.LocalRotation;
                 }
+                builder.Append(PositionToString(CovertPosition(currentPosition)) + " " + RotationToString(ConvertRotation(currentRotation)));
             }
-            fs.WriteLine(buf);
+            else
+            {
+                currentRotation = current.LocalRotation;
+
+                if (current.ChildCount == 0)
+                {
+                    // Terminate される。Terminate の Rotation は不要。
+                    Debug.Assert(current.IsTerminated);
+                    return;
+                }
+#if false
+                if (current.Transform.name.ToLower() == "hand_r")
+                {
+                    Debug.Log(current.Transform.name + " : localRotation=" + NormalizeEulerAngle(current.Transform.localRotation.eulerAngles).ToString("F8"));
+                    Debug.Log(current.Transform.name + " : currentRotation=" + NormalizeEulerAngle(currentRotation.eulerAngles).ToString("F8") + ", " + currentRotation.ToString("F8"));
+                    //Debug.Log(current.Transform.name + " : " + NormalizeEulerAngle(ToEulerXYZ(currentRotation)).ToString("F8") + ", " + currentRotation.ToString("F8"));
+                }
+#endif
+                builder.Append(" " + RotationToString(ConvertRotation(currentRotation)));
+            }
+            foreach(var child in current.Children)
+            {
+                DumpHumanTransform(child, currentRotation, builder);
+            }
         }
 
         private void BackupTransforms(in LinkedList<Vector3> positions, in LinkedList<Quaternion> rotations, in Transform root)
@@ -465,7 +608,7 @@ namespace ippanjin21
             }
         }
 
-        private void RecoverTransforms(in LinkedList<Vector3> positions, in LinkedList<Quaternion> rotations, in Transform root)
+        private void RestoreTransforms(in LinkedList<Vector3> positions, in LinkedList<Quaternion> rotations, in Transform root)
         {
             root.localPosition = positions.First.Value;
             root.localRotation = rotations.First.Value;
@@ -473,7 +616,7 @@ namespace ippanjin21
             rotations.RemoveFirst();
             for (int i = 0; i < root.childCount; i ++)
             {
-                RecoverTransforms(positions, rotations, root.GetChild(i));
+                RestoreTransforms(positions, rotations, root.GetChild(i));
             }
         }
 
@@ -487,14 +630,53 @@ namespace ippanjin21
             return buf;
         }
 
- 
+        private Vector3 CovertPosition(in Vector3 position)
+        {
+            return _ToRightHandedCoordinate? new Vector3(-position.x, position.y, position.z) : position;
+        }
+
+        private Quaternion ConvertRotation(in Quaternion rotation)
+        {
+            return _ToRightHandedCoordinate ? Quaternion.Inverse(new Quaternion(-rotation.x, rotation.y, rotation.z, rotation.w)) : rotation;
+        }
+
+        private string PositionToString(in Vector3 position)
+        {
+            return position.x.ToString("F8") + " " + position.y.ToString("F8") + " " + position.z.ToString("F8");
+        }
+
+        private string RotationToString(in Quaternion rotation)
+        {
+            Vector3 eulerAngles = rotation.eulerAngles;
+            return eulerAngles.y.ToString("F8") + " " + eulerAngles.x.ToString("F8") + " " + eulerAngles.z.ToString("F8");
+        }
+
+        private static Vector3 ToEulerXYZ(in Quaternion rotation)
+        {
+            float sy = -(2.0f * rotation.x * rotation.z - 2.0f * rotation.y * rotation.w);
+            bool unlocked = Mathf.Abs(sy) < 0.99999999f;
+            float x, y, z;
+
+            if (unlocked)
+            {
+                x = Mathf.Atan2(2.0f * rotation.y * rotation.z + 2.0f * rotation.x * rotation.w, 2.0f * rotation.w * rotation.w + 2.0f * rotation.z * rotation.z - 1.0f);
+                z = Mathf.Atan2(2.0f * rotation.x * rotation.y + 2.0f * rotation.z * rotation.w, 2.0f * rotation.w * rotation.w + 2.0f * rotation.x * rotation.x - 1.0f);
+            }
+            else
+            {
+                x = 0.0f;
+                z = Mathf.Atan2(-(2.0f * rotation.x * rotation.y - 2.0f * rotation.z * rotation.w), 2.0f * rotation.w * rotation.w + 2.0f * rotation.y * rotation.y - 1.0f);
+            }
+            y = Mathf.Asin(sy);
+            return new Vector3(x * 180.0f / Mathf.PI, y * 180.0f / Mathf.PI, z * 180.0f / Mathf.PI);
+        }
 
         private static Vector3 NormalizeEulerAngle(in Vector3 angle)
         {
-            return new Vector3(
-                angle.x > 180.0f ? angle.x - 360.0f : angle.x,
-                angle.y > 180.0f ? angle.y - 360.0f : angle.y,
-                angle.z > 180.0f ? angle.z - 360.0f : angle.z);
+            // 360 を 0 にするのは間違いか？ Normalize の問題はどう解く？
+            return new Vector3(angle.x > 180.0f ? (angle.x - 360.0f) : angle.x,
+                angle.y > 180.0f ? (angle.y - 360.0f) : angle.y,
+                angle.z > 180.0f ? (angle.z - 360.0f) : angle.z);
         }
 
         private bool IsDescendantOf(in Transform target, in Transform ancestor)
